@@ -1,0 +1,399 @@
+// Bayern Card Club — схема БД (PostgreSQL 16, Prisma).
+// Игровые рейтинги и карточки — тестовые, не официальные данные клуба.
+// Частичные индексы и CHECK-ограничения лежат в prisma/migrations/*/migration.sql
+// (Prisma их не описывает), см. комментарии "SQL-миграция" ниже.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Rarity {
+  COMMON
+  RARE
+  EPIC
+  LEGENDARY
+}
+
+enum Position {
+  GK
+  DEF
+  MID
+  FWD
+}
+
+enum ListingStatus {
+  ACTIVE
+  SOLD
+  CANCELLED
+}
+
+enum TxType {
+  DAILY_REWARD
+  TASK_REWARD
+  PACK_PURCHASE
+  CARD_SELL
+  CARD_UPGRADE
+  ALBUM_REWARD
+  MARKET_BUY
+  MARKET_SALE
+  MARKET_FEE
+  ADMIN_COMPENSATION
+  ACHIEVEMENT_REWARD
+}
+
+enum ProductKind {
+  VIP
+  SUBSCRIPTION
+  COSMETIC
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+}
+
+// ───────────── Пользователи и кошелёк ─────────────
+
+model User {
+  id               BigInt    @id @default(autoincrement())
+  telegramId       BigInt    @unique
+  username         String?   @db.VarChar(64)
+  firstName        String    @db.VarChar(128)
+  photoUrl         String?   @db.VarChar(512)
+  languageCode     String?   @db.VarChar(8)
+  isVip            Boolean   @default(false)
+  isBanned         Boolean   @default(false)
+  banReason        String?   @db.VarChar(256)
+  notifyEnabled    Boolean   @default(true)
+  title            String?   @db.VarChar(64)
+  createdAt        DateTime  @default(now())
+  lastSeenAt       DateTime  @default(now())
+
+  wallet           Wallet?
+  cards            UserCard[]
+  listings         MarketListing[]   @relation("Seller")
+  purchases        MarketTransaction[] @relation("Buyer")
+  sales            MarketTransaction[] @relation("SellerTx")
+  taskProgress     UserTaskProgress[]
+  albumClaims      AlbumRewardClaim[]
+  achievements     UserAchievement[]
+  orders           Order[]
+  subscriptions    Subscription[]
+
+  // Админ-список недавно зарегистрированных.
+  // SQL-миграция: частичный индекс по isBanned WHERE isBanned (забаненных единицы — индекс крошечный)
+  @@index([createdAt(sort: Desc)])
+}
+
+model Wallet {
+  userId    BigInt   @id
+  coins     BigInt   @default(0)
+  version   Int      @default(0) // оптимистичная блокировка
+  updatedAt DateTime @updatedAt
+
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+  // SQL-миграция: CHECK (coins >= 0) — баланс не уходит в минус ни при каких гонках
+}
+
+model WalletTransaction {
+  id             BigInt   @id @default(autoincrement())
+  userId         BigInt
+  type           TxType
+  amount         BigInt   // со знаком: + начисление, − списание
+  balanceAfter   BigInt
+  source         String   @db.VarChar(64)  // откуда (pack, market, admin...)
+  destination    String   @db.VarChar(64)  // куда
+  refType        String?  @db.VarChar(32)
+  refId          String?  @db.VarChar(64)
+  idempotencyKey String?  @unique @db.VarChar(96)
+  createdAt      DateTime @default(now())
+
+  wallet Wallet @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  // История пользователя с пагинацией по времени
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([refType, refId])
+}
+
+// ───────────── Карточки, альбомы ─────────────
+
+model PlayerCard {
+  id          Int      @id @default(autoincrement())
+  slug        String   @unique @db.VarChar(64)
+  name        String   @db.VarChar(96)
+  position    Position
+  rating      Int      @db.SmallInt // ИГРОВОЙ тестовый рейтинг
+  rarity      Rarity
+  series      String   @db.VarChar(48)
+  description String   @db.VarChar(512)
+  imageKey    String   @db.VarChar(96)
+  tradable    Boolean  @default(true)
+  isActive    Boolean  @default(true)
+  dropWeight  Int      @default(100) // вес выпадения из набора
+  createdAt   DateTime @default(now())
+
+  owned UserCard[]
+  items CollectionItem[]
+
+  @@index([rarity, isActive])   // выбор карты при открытии набора
+  @@index([series, position])   // фильтры коллекции
+}
+
+model UserCard {
+  id         BigInt   @id @default(autoincrement())
+  userId     BigInt
+  cardId     Int
+  level      Int      @default(1) @db.SmallInt
+  isListed   Boolean  @default(false) // карта занята объявлением
+  obtainedAt DateTime @default(now())
+  source     String   @db.VarChar(32) // pack / market / reward
+
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  card    PlayerCard      @relation(fields: [cardId], references: [id])
+  listing MarketListing[]
+
+  // Коллекция пользователя, фильтры, подсчёт дубликатов и прогресса альбома
+  @@index([userId, cardId])
+  @@index([userId, obtainedAt(sort: Desc)])
+}
+
+model Collection {
+  id          Int      @id @default(autoincrement())
+  slug        String   @unique @db.VarChar(64)
+  title       String   @db.VarChar(96)
+  rewardCoins Int      @default(500)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+
+  items  CollectionItem[]
+  claims AlbumRewardClaim[]
+}
+
+model CollectionItem {
+  collectionId Int
+  cardId       Int
+
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  card       PlayerCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@id([collectionId, cardId])
+  @@index([cardId])
+}
+
+model AlbumRewardClaim {
+  userId       BigInt
+  collectionId Int
+  claimedAt    DateTime @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  collection Collection @relation(fields: [collectionId], references: [id])
+
+  // Награда за страницу — строго один раз на пользователя
+  @@id([userId, collectionId])
+}
+
+// ───────────── Задания, достижения, сезоны ─────────────
+
+model DailyTask {
+  id          Int      @id @default(autoincrement())
+  code        String   @unique @db.VarChar(48) // login, free_pack, view_collection, trade, album_page
+  title       String   @db.VarChar(96)
+  target      Int      @default(1)
+  rewardCoins Int      @default(100)
+  clubPassOnly Boolean @default(false)
+  isActive    Boolean  @default(true)
+
+  progress UserTaskProgress[]
+}
+
+model UserTaskProgress {
+  userId    BigInt
+  taskId    Int
+  day       DateTime @db.Date // день по UTC
+  progress  Int      @default(0)
+  claimedAt DateTime?
+
+  user User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task DailyTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Одна запись на задание в день: повторный запрос не создаёт вторую награду
+  @@id([userId, taskId, day])
+  @@index([day])
+}
+
+model Achievement {
+  id          Int    @id @default(autoincrement())
+  code        String @unique @db.VarChar(48)
+  title       String @db.VarChar(96)
+  description String @db.VarChar(256)
+  rewardCoins Int    @default(0)
+
+  users UserAchievement[]
+}
+
+model UserAchievement {
+  userId        BigInt
+  achievementId Int
+  unlockedAt    DateTime @default(now())
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievement Achievement @relation(fields: [achievementId], references: [id])
+
+  @@id([userId, achievementId])
+}
+
+model Season {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(96)
+  startsAt  DateTime
+  endsAt    DateTime
+  isActive  Boolean  @default(false)
+
+  // Поиск активного сезона
+  @@index([isActive, endsAt])
+}
+
+// ───────────── Рынок ─────────────
+
+model MarketListing {
+  id         BigInt        @id @default(autoincrement())
+  sellerId   BigInt
+  userCardId BigInt
+  price      Int
+  status     ListingStatus @default(ACTIVE)
+  createdAt  DateTime      @default(now())
+  closedAt   DateTime?
+
+  seller  User       @relation("Seller", fields: [sellerId], references: [id])
+  card    UserCard   @relation(fields: [userCardId], references: [id])
+  priceHistory ListingPriceHistory[]
+  trade   MarketTransaction?
+
+  // «Мои объявления» и история продавца.
+  // Лента рынка — частичные индексы WHERE status = 'ACTIVE' в SQL-миграции:
+  // проданные и снятые объявления не раздувают индекс и память.
+  @@index([sellerId, status])
+  @@index([userCardId])
+  // SQL-миграция: частичный UNIQUE (userCardId) WHERE status = 'ACTIVE' —
+  // одну карту нельзя выставить дважды
+  // SQL-миграция: CHECK (price > 0)
+}
+
+model ListingPriceHistory {
+  id        BigInt   @id @default(autoincrement())
+  listingId BigInt
+  oldPrice  Int?
+  newPrice  Int
+  changedAt DateTime @default(now())
+
+  listing MarketListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@index([listingId, changedAt])
+}
+
+model MarketTransaction {
+  id         BigInt   @id @default(autoincrement())
+  listingId  BigInt   @unique // одно объявление — одна сделка, повторная покупка невозможна
+  buyerId    BigInt
+  sellerId   BigInt
+  price      Int
+  fee        Int
+  createdAt  DateTime @default(now())
+
+  listing MarketListing @relation(fields: [listingId], references: [id])
+  buyer   User          @relation("Buyer", fields: [buyerId], references: [id])
+  seller  User          @relation("SellerTx", fields: [sellerId], references: [id])
+
+  @@index([buyerId, createdAt(sort: Desc)])
+  @@index([sellerId, createdAt(sort: Desc)])
+}
+
+// ───────────── Магазин, платежи Telegram Stars ─────────────
+
+model Product {
+  id          Int         @id @default(autoincrement())
+  code        String      @unique @db.VarChar(48)
+  kind        ProductKind
+  title       String      @db.VarChar(96)
+  description String      @db.VarChar(256)
+  starsPrice  Int
+  durationDays Int?       // для подписки
+  isActive    Boolean     @default(true)
+
+  orders Order[]
+}
+
+model Order {
+  id        String      @id @default(uuid()) @db.Uuid // payload инвойса
+  userId    BigInt
+  productId Int
+  stars     Int
+  status    OrderStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+  paidAt    DateTime?
+
+  user    User     @relation(fields: [userId], references: [id])
+  product Product  @relation(fields: [productId], references: [id])
+  payment Payment?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+}
+
+model Payment {
+  id                      BigInt   @id @default(autoincrement())
+  orderId                 String   @unique @db.Uuid
+  telegramPaymentChargeId String   @unique @db.VarChar(128) // защита от повторного начисления
+  currency                String   @db.VarChar(8) // XTR
+  totalAmount             Int
+  refundedAt              DateTime?
+  createdAt               DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+model Subscription {
+  id        BigInt             @id @default(autoincrement())
+  userId    BigInt
+  productId Int
+  status    SubscriptionStatus @default(ACTIVE)
+  startsAt  DateTime           @default(now())
+  expiresAt DateTime
+  cancelledAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Проверка активной подписки и выборка истёкших фоновой задачей
+  @@index([userId, status, expiresAt])
+  @@index([status, expiresAt])
+}
+
+// ───────────── Админка ─────────────
+
+model AdminAuditLog {
+  id         BigInt   @id @default(autoincrement())
+  adminTgId  BigInt
+  action     String   @db.VarChar(64)
+  targetType String   @db.VarChar(32)
+  targetId   String   @db.VarChar(64)
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+}

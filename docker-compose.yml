@@ -1,0 +1,37 @@
+# Только инфраструктура. Приложение (api + bot + статика) — один Node-процесс,
+# появится в следующем этапе; для разработки его запускают на хосте: npm run dev.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bayern
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в .env}
+      POSTGRES_DB: bayern_cards
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres.conf:/etc/postgresql/postgresql.conf:ro
+    ports: ["127.0.0.1:5432:5432"]
+    mem_limit: 256m
+    shm_size: 64m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bayern -d bayern_cards"]
+      interval: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/etc/redis/redis.conf"]
+    volumes:
+      - ./deploy/redis.conf:/etc/redis/redis.conf:ro
+    ports: ["127.0.0.1:6379:6379"]
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 12
+
+volumes:
+  pgdata:
